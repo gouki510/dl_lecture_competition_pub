@@ -11,6 +11,19 @@ import torch.nn as nn
 import torchvision
 from torchvision import transforms
 
+from tqdm import tqdm
+import wandb
+from argparse import ArgumentParser
+
+args = ArgumentParser()
+args.add_argument("--epoch", type=int, default=20)
+args.add_argument("--batch_size", type=int, default=128)
+args.add_argument("--lr", type=float, default=0.001)
+args.add_argument("--weight_decay", type=float, default=1e-5)
+args.add_argument("--gpu", type=str, default="cuda:2")
+args.add_argument("--expansion", type=int, default=1)
+args = args.parse_args()
+
 
 def set_seed(seed):
     random.seed(seed)
@@ -237,22 +250,23 @@ class BottleneckBlock(nn.Module):
 
 
 class ResNet(nn.Module):
-    def __init__(self, block, layers):
+    def __init__(self, block, layers, expansion=1):
         super().__init__()
-        self.in_channels = 64
+        self.expansion = expansion
+        self.in_channels = 64 * expansion
 
-        self.conv1 = nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3)
-        self.bn1 = nn.BatchNorm2d(64)
+        self.conv1 = nn.Conv2d(3, 64 * expansion, kernel_size=7, stride=2, padding=3)
+        self.bn1 = nn.BatchNorm2d(64 * expansion)
         self.relu = nn.ReLU(inplace=True)
         self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
 
-        self.layer1 = self._make_layer(block, layers[0], 64)
-        self.layer2 = self._make_layer(block, layers[1], 128, stride=2)
-        self.layer3 = self._make_layer(block, layers[2], 256, stride=2)
-        self.layer4 = self._make_layer(block, layers[3], 512, stride=2)
+        self.layer1 = self._make_layer(block, layers[0], 64 * expansion)
+        self.layer2 = self._make_layer(block, layers[1], 128 * expansion, stride=2)
+        self.layer3 = self._make_layer(block, layers[2], 256 * expansion, stride=2)
+        self.layer4 = self._make_layer(block, layers[3], 512 * expansion, stride=2)
 
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
-        self.fc = nn.Linear(512 * block.expansion, 512)
+        self.fc = nn.Linear(512 * expansion * block.expansion, 512)
 
     def _make_layer(self, block, blocks, out_channels, stride=1):
         layers = []
@@ -279,19 +293,21 @@ class ResNet(nn.Module):
         return x
 
 
-def ResNet18():
-    return ResNet(BasicBlock, [2, 2, 2, 2])
+def ResNet18(expansion: int):
+    return ResNet(BasicBlock, [2, 2, 2, 2], expansion)
 
 
-def ResNet50():
-    return ResNet(BottleneckBlock, [3, 4, 6, 3])
+def ResNet50(expansion: int):
+    return ResNet(BottleneckBlock, [3, 4, 6, 3], expansion)
 
 
 class VQAModel(nn.Module):
-    def __init__(self, vocab_size: int, n_answer: int):
+    def __init__(self, vocab_size: int, n_answer: int, expansion: int):
         super().__init__()
-        self.resnet = ResNet18()
-        self.text_encoder = nn.Linear(vocab_size, 512)
+        self.resnet = ResNet18(expansion)
+        self.text_encoder = nn.Sequential(
+            nn.Linear(vocab_size, 512),
+        )
 
         self.fc = nn.Sequential(
             nn.Linear(1024, 512),
@@ -318,7 +334,7 @@ def train(model, dataloader, optimizer, criterion, device):
     simple_acc = 0
 
     start = time.time()
-    for image, question, answers, mode_answer in dataloader:
+    for image, question, answers, mode_answer in tqdm(dataloader):
         image, question, answer, mode_answer = \
             image.to(device), question.to(device), answers.to(device), mode_answer.to(device)
 
@@ -332,6 +348,12 @@ def train(model, dataloader, optimizer, criterion, device):
         total_loss += loss.item()
         total_acc += VQA_criterion(pred.argmax(1), answers)  # VQA accuracy
         simple_acc += (pred.argmax(1) == mode_answer).float().mean().item()  # simple accuracy
+        
+        wandb.log({
+            "train_loss": loss.item(),
+            "train_acc": total_acc / len(dataloader),
+            "train_simple_acc": simple_acc / len(dataloader)
+        })
 
     return total_loss / len(dataloader), total_acc / len(dataloader), simple_acc / len(dataloader), time.time() - start
 
@@ -344,7 +366,7 @@ def eval(model, dataloader, optimizer, criterion, device):
     simple_acc = 0
 
     start = time.time()
-    for image, question, answers, mode_answer in dataloader:
+    for image, question, answers, mode_answer in tqdm(dataloader):
         image, question, answer, mode_answer = \
             image.to(device), question.to(device), answers.to(device), mode_answer.to(device)
 
@@ -354,33 +376,51 @@ def eval(model, dataloader, optimizer, criterion, device):
         total_loss += loss.item()
         total_acc += VQA_criterion(pred.argmax(1), answers)  # VQA accuracy
         simple_acc += (pred.argmax(1) == mode_answer).mean().item()  # simple accuracy
+        
+        wandb.log({
+            "val_loss": loss.item(),
+            "val_acc": total_acc / len(dataloader),
+            "val_simple_acc": simple_acc / len(dataloader)
+        })
 
     return total_loss / len(dataloader), total_acc / len(dataloader), simple_acc / len(dataloader), time.time() - start
 
 
-def main():
+def main(args):
     # deviceの設定
     set_seed(42)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = args.gpu
+    
+    wandb.init(project="dl_lecture_competition", config=args)
 
     # dataloader / model
     transform = transforms.Compose([
         transforms.Resize((224, 224)),
-        transforms.ToTensor()
+        transforms.ToTensor(),
+        # rotate
+        transforms.RandomRotation(90),
+        # flip
+        transforms.RandomHorizontalFlip(),
+        # crop
+        transforms.RandomResizedCrop(224, scale=(0.8, 1.0), ratio=(0.9, 1.1)),
+        # color jitter
+        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
+        # noise
+        transforms.GaussianBlur(kernel_size=(5, 9), sigma=(0.1, 5)),
     ])
     train_dataset = VQADataset(df_path="./data/train.json", image_dir="./data/train", transform=transform)
     test_dataset = VQADataset(df_path="./data/valid.json", image_dir="./data/valid", transform=transform, answer=False)
     test_dataset.update_dict(train_dataset)
 
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=128, shuffle=True)
+    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
     test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False)
 
-    model = VQAModel(vocab_size=len(train_dataset.question2idx)+1, n_answer=len(train_dataset.answer2idx)).to(device)
+    model = VQAModel(vocab_size=len(train_dataset.question2idx)+1, n_answer=len(train_dataset.answer2idx), expansion=args.expansion).to(device)
 
     # optimizer / criterion
-    num_epoch = 20
+    num_epoch = args.epoch
     criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     # train model
     for epoch in range(num_epoch):
@@ -399,11 +439,19 @@ def main():
         pred = model(image, question)
         pred = pred.argmax(1).cpu().item()
         submission.append(pred)
+        
+        # wandb.log({
+        #     "test/image": wandb.Image(image[0].cpu()),
+        #     "test/question": train_dataset.idx2question[question[0].argmax(0).item()],
+        #     "test/pred": train_dataset.idx2answer[pred[0].item()]
+        # })
 
     submission = [train_dataset.idx2answer[id] for id in submission]
     submission = np.array(submission)
     torch.save(model.state_dict(), "model.pth")
-    np.save("submission.npy", submission)
+    import datetime
+    date_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    np.save(f"submission_{date_time}.npy", submission)
 
 if __name__ == "__main__":
-    main()
+    main(args)
